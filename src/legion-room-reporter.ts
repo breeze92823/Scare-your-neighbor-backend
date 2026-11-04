@@ -1,9 +1,9 @@
-// Bloxity cross-pod room directory: pushes this pod's live rooms to the matchmaker
+// Boxity cross-pod room directory: pushes this pod's live rooms to the matchmaker
 // every ~2s so "Open Rooms", friend joins and join-by-id work across pods.
-// No-op unless deployed by Bloxity hosting (BLOXITY_REPORT_TOKEN, MATCHMAKER_REPORT_URL,
+// No-op unless deployed by Boxity hosting (BLOXITY_REPORT_TOKEN, MATCHMAKER_REPORT_URL,
 // BLOXITY_GAME_ID), so it is safe locally. Call installRoomReporter() after listen().
 
-import { matchMaker } from "@colyseus/core";
+import { matchMaker } from "colyseus";
 
 export function installRoomReporter(): void {
   const base = process.env.MATCHMAKER_REPORT_URL;

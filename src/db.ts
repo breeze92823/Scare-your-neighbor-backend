@@ -22,11 +22,37 @@ export interface PlayerDoc {
   aura?: string; // the worn aura, "" = none
   costumes?: string[]; // owned costume ids (client config.js COSTUMES)
   costume?: string; // the worn costume, "" = none
-  lastSeen?: number; // epoch ms of the last activity
+  lastSeen?: number; // epoch ms of the last activity (the server stamps it: on load, on every save and when the player leaves)
+  // The base (client base.js): saved so it keeps earning while the player is away.
+  income?: number; // $/s the active items earn (offline money = seconds away x this)
+  pile?: number; // Offline Money waiting at the base, not yet collected (the client adds it up)
+  baseLevel?: number; // Upgrade Base level (minions)
+  slotsBought?: number; // item slot purchases
+  boothLevel?: number;
+  millLevel?: number;
+  baseItems?: SavedItem[];
+  basePackages?: SavedPackage[];
   // Free Gift (ad reward): written only by the server's `adGift` handler, never by saveProgress.
   giftAt?: number; // epoch ms of the last paid ad gift
   version: number;
   updatedAt: Date;
+}
+
+// One base item / package on the floor (plot-local x, z).
+export interface SavedItem {
+  name: string;
+  rarity: string;
+  value: number;
+  rate: number;
+  active: boolean;
+  x: number;
+  z: number;
+}
+export interface SavedPackage {
+  tier: string;
+  hp: number;
+  x: number;
+  z: number;
 }
 
 let client: MongoClient | null = null;

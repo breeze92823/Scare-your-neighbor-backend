@@ -14,6 +14,8 @@ export const UID_MAX_LEN = 128;
 // Presence (presence.ts): the Bloxity avatar JSON relayed for the others to draw, and the pose
 // bounds (|x|, |z| up to `xy` m, y up to `y` m; speed in m/s). The lobby is a few hundred metres wide.
 export const AVATAR_MAX_LEN = 3000;
+// A player's base snapshot (packages, items, levels: client remoteBases.js), relayed as a JSON string.
+export const PLOT_MAX_LEN = 6000;
 export const POSE_BOUNDS = { xy: 2000, y: 200, speed: 200 };
 
 // Colyseus drops the whole connection for a WebSocket message above this (default 4 KB).
@@ -28,6 +30,15 @@ export const MONEY_MAX = 1e33; // money / lifetime earnings
 export const STAT_MAX = 1e12; // speed, scare level, scare + steal counters
 export const PLAY_SECONDS_MAX = 31_536_000; // ~1 year
 export const OWNED_MAX = 64; // owned auras / costumes (client AURAS + COSTUMES, with slack)
+
+// The player's base, saved so it keeps earning while they are away (client base.js store): items and
+// packages on the floor and the levels. The base's income ($/s) is saved too; the server turns the time
+// since the player was last seen into "Offline Money" (at most OFFLINE_MAX_SECONDS) when they come back.
+export const BASE_ITEMS_MAX = 64;
+export const BASE_PACKAGES_MAX = 64;
+export const LEVEL_MAX = 100;
+export const OFFLINE_MAX_SECONDS = 24 * 60 * 60;
+export const BASE_COORD_MAX = 100; // plot-local metres
 
 // Neighbours (client neighbours.js): the lobby has this many North Lane houses at most. A house the
 // player is engaging is relayed through the roster so everybody sees the neighbour's animation.

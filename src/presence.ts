@@ -1,5 +1,5 @@
 import {
-  AVATAR_MAX_LEN, HOUSES_MAX, ID_PATTERN, NEIGHBOUR_FACES, NEIGHBOUR_POSES, NEIGHBOUR_STATES, NEIGHBOUR_TEXT_MAX, POSE_BOUNDS, ROOM_MAX_CLIENTS,
+  AVATAR_MAX_LEN, HOUSES_MAX, PLOT_MAX_LEN, ID_PATTERN, NEIGHBOUR_FACES, NEIGHBOUR_POSES, NEIGHBOUR_STATES, NEIGHBOUR_TEXT_MAX, POSE_BOUNDS, ROOM_MAX_CLIENTS,
 } from "./constants.js";
 import type { HouseState, PlayerState } from "./rooms/schema/WorldState.js";
 
@@ -45,6 +45,19 @@ export function applyLoadout(p: PlayerState, msg: unknown): void {
 export function applyAvatar(p: PlayerState, msg: unknown): void {
   const a = (msg as { avatar?: unknown })?.avatar;
   if (typeof a === "string" && a.length <= AVATAR_MAX_LEN) p.avatar = a;
+}
+
+// `plot` { plot }: the sender's base snapshot as a JSON object string (length-capped, must parse as an object):
+// the other players draw it on that player's base.
+export function applyPlot(p: PlayerState, msg: unknown): void {
+  const s = (msg as { plot?: unknown })?.plot;
+  if (typeof s !== "string" || s.length > PLOT_MAX_LEN) return;
+  try {
+    const v = JSON.parse(s);
+    if (v && typeof v === "object" && !Array.isArray(v)) p.plot = s;
+  } catch {
+    // Not JSON: ignored.
+  }
 }
 
 // `emote` { id }: a Bloxity emote id (24 hex chars in practice, any slug is accepted), "" = stopped.

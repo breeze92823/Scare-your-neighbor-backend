@@ -75,6 +75,22 @@ describe("presence", () => {
     assert.strictEqual(seen.x, POSE_BOUNDS.xy);
   });
 
+  it("relays a player's base snapshot, only as capped JSON", async () => {
+    const room = await colyseus.createRoom<WorldState>("world", {});
+    const a = await colyseus.connectTo(room, { userId: "guest-a" });
+    await sleep(50);
+    const p = room.state.players.get(a.sessionId)!;
+    const snap = JSON.stringify({ b: 2, m: 1, l: 3, n: 3, p: [["box", 1, 2, 0]], i: [["Yo Yo", 4, 5]] });
+    a.send("plot", { plot: snap });
+    await sleep(50);
+    assert.strictEqual(p.plot, snap);
+    a.send("plot", { plot: "not json" });
+    a.send("plot", { plot: "[1]" });
+    a.send("plot", { plot: JSON.stringify({ x: "y".repeat(7000) }) });
+    await sleep(50);
+    assert.strictEqual(p.plot, snap, "malformed or oversized snapshots are ignored");
+  });
+
   it("relays emotes with a counter, so the same emote plays again", async () => {
     const room = await colyseus.createRoom<WorldState>("world", {});
     const a = await colyseus.connectTo(room, { userId: "guest-a" });

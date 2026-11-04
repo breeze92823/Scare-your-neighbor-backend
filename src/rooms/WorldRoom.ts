@@ -2,11 +2,11 @@ import { Room, Client, CloseCode } from "colyseus";
 import { WorldState, PlayerState, HouseState } from "./schema/WorldState.js";
 import {
   AD_GIFT_COOLDOWN_MS, AD_GIFT_MONEY, GUEST_ID_PREFIX, LEADERBOARD_EVERY_MS, NAME_MAX, NEIGHBOUR_STALE_MS, PFP_MAX_LEN, REWARD_TOKEN_MAX_LEN,
-  RECONNECT_SECONDS, ROOM_MAX_CLIENTS, UID_MAX_LEN,
+  OFFLINE_MAX_SECONDS, RECONNECT_SECONDS, ROOM_MAX_CLIENTS, UID_MAX_LEN,
 } from "../constants.js";
 import { getPlayers, type PlayerDoc } from "../db.js";
 import { sanitizeProgress } from "../sanitize.js";
-import { applyAvatar, applyEmote, applyHouse, applyLoadout, applyPose, assignBase, readHouseIndex } from "../presence.js";
+import { applyPlot, applyAvatar, applyEmote, applyHouse, applyLoadout, applyPose, assignBase, readHouseIndex } from "../presence.js";
 import { ranksOf, topBoards } from "../leaderboard.js";
 import { verifyReward } from "../ads.js";
 
@@ -67,7 +67,7 @@ export class WorldRoom extends Room<{ state: WorldState }> {
           { _id: userId },
           {
             // Display name comes from this connection's own PlayerState, not `msg`.
-            $set: { ...rest, username: p.username || "Player", updatedAt: new Date() },
+            $set: { ...rest, username: p.username || "Player", lastSeen: Date.now(), updatedAt: new Date() },
             ...(Object.keys(max).length && { $max: max }),
             $setOnInsert: { version: 1 },
           },
@@ -90,6 +90,11 @@ export class WorldRoom extends Room<{ state: WorldState }> {
     setAvatar: (client: Client, msg: unknown) => {
       const p = this.state.players.get(client.sessionId);
       if (p) applyAvatar(p, msg);
+    },
+    // The sender's base (levels, packages, items, minions) for the others to draw on its plot.
+    plot: (client: Client, msg: unknown) => {
+      const p = this.state.players.get(client.sessionId);
+      if (p) applyPlot(p, msg);
     },
     // A Bloxity emote started ({ id }) or stopped ({ id: "" }).
     emote: (client: Client, msg: unknown) => {
@@ -224,6 +229,18 @@ export class WorldRoom extends Room<{ state: WorldState }> {
     }
   }
 
+  // The player is here now: offline time is counted from this moment on.
+  private async stampSeen(sessionId: string, at: number) {
+    const userId = this.userIds.get(sessionId);
+    const players = getPlayers();
+    if (!userId || !players) return;
+    try {
+      await players.updateOne({ _id: userId }, { $set: { lastSeen: at } });
+    } catch (err) {
+      console.warn("[WorldRoom] stampSeen failed", err);
+    }
+  }
+
   // Server-clock "last seen" for a player who has really gone. Call before forgetSession.
   private async stampLastSeen(sessionId: string) {
     const userId = this.userIds.get(sessionId);
@@ -324,7 +341,14 @@ export class WorldRoom extends Room<{ state: WorldState }> {
     const now = Date.now();
     if (!this.giftAt.has(client.sessionId) || userId) this.giftAt.set(client.sessionId, Number(doc?.giftAt) || 0);
     if (!doc) client.send("noProgress", { serverTime: now });
-    else client.send("progress", { ...(sanitizeProgress(doc) ?? {}), serverTime: now });
+    else {
+      // Offline Money: what the base earned while the player was away (income x time since last seen, capped).
+      // The client adds it to the pile at its base; the stamp below makes sure it is counted only once.
+      const away = doc.lastSeen ? Math.min(OFFLINE_MAX_SECONDS, Math.max(0, (now - doc.lastSeen) / 1000)) : 0;
+      const offline = Math.floor((doc.income ?? 0) * away);
+      client.send("progress", { ...(sanitizeProgress(doc) ?? {}), offline, away: Math.floor(away), serverTime: now });
+      await this.stampSeen(client.sessionId, now);
+    }
     client.send("giftResult", { ok: false, reason: "init", nextAt: this.giftAt.get(client.sessionId) ?? 0, serverTime: now });
     void this.sendLeaderboard(client);
   }

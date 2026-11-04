@@ -24,6 +24,7 @@ export const PlayerState = schema(
     costume: t.string().default(""),
     emote: t.string().default(""), // "<id>#<n>": the Bloxity emote playing (n changes on every play), "" = none
     avatar: t.string().default(""), // Bloxity look JSON { equipped, proportions, skin }, "" = default
+    plot: t.string().default(""), // the player's base snapshot JSON (machine levels, packages, items, minions), "" = nothing yet
   },
   "PlayerState",
 );
