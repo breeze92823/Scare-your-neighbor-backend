@@ -27,6 +27,7 @@
     "typescript": "^5.0.4"
   },
   "dependencies": {
+    "@colyseus/core": "^0.18.26",
     "@colyseus/schema": "^5.0.14",
     "@colyseus/tools": "^0.18.1",
     "colyseus": "^0.18.2",
