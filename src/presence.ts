@@ -30,7 +30,7 @@ export function applyPose(p: PlayerState, msg: unknown): void {
 
 // `state` { hold, aura, costume }: what is in the right hand ("" | "pkg:<kind>" | "item:<name>") and the
 // worn aura / costume ids ("" = none). An item name may hold spaces and apostrophes (INDEX names).
-const HOLD_PATTERN = /^(pkg:[A-Za-z0-9_-]{1,32}|item:[\w '.&!-]{1,48})?$/;
+const HOLD_PATTERN = /^(pkg:[A-Za-z0-9_-]{1,32}|item:[^<>\\"\u0000-\u001f]{1,48})?$/;
 export function applyLoadout(p: PlayerState, msg: unknown): void {
   if (!msg || typeof msg !== "object") return;
   const m = msg as Record<string, unknown>;

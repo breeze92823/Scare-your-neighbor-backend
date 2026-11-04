@@ -1,12 +1,14 @@
 import { Room, Client, CloseCode } from "colyseus";
-import { WorldState, PlayerState } from "./schema/WorldState.js";
-import { DISTANCE_MAX, GUEST_ID_PREFIX, LEADERBOARD_EVERY_MS, NAME_MAX, PFP_MAX_LEN, RECONNECT_SECONDS, ROOM_MAX_CLIENTS } from "../constants.js";
+import { WorldState, PlayerState, HouseState } from "./schema/WorldState.js";
+import {
+  AD_GIFT_COOLDOWN_MS, AD_GIFT_MONEY, GUEST_ID_PREFIX, LEADERBOARD_EVERY_MS, NAME_MAX, NEIGHBOUR_STALE_MS, PFP_MAX_LEN, REWARD_TOKEN_MAX_LEN,
+  RECONNECT_SECONDS, ROOM_MAX_CLIENTS, UID_MAX_LEN,
+} from "../constants.js";
 import { getPlayers, type PlayerDoc } from "../db.js";
 import { sanitizeProgress } from "../sanitize.js";
-import { accrue, rollWedge, spinStateFrom, type SpinState } from "../spin.js";
-import { claimDaily, dailyFields, dailyView, readDaily, rollDaily, type DailyState } from "../daily.js";
-import { applyAvatar, applyLoadout, applyPose } from "../presence.js";
+import { applyAvatar, applyEmote, applyHouse, applyLoadout, applyPose, assignBase, readHouseIndex } from "../presence.js";
 import { ranksOf, topBoards } from "../leaderboard.js";
+import { verifyReward } from "../ads.js";
 
 function sanitizeName(raw: unknown): string {
   return typeof raw === "string" ? raw.slice(0, NAME_MAX) : "";
@@ -17,11 +19,14 @@ function sanitizePfp(raw: unknown): string {
 }
 
 /**
- * Room every client joins via `client.joinOrCreate("world", { userId, username })`. Loads and
- * saves each signed-in player's progress (MongoDB, see db.ts) -- the client keeps no save of its
- * own, so this is the only place progress lives. The game is client-authoritative: no gameplay
+ * Room every client joins via `client.joinOrCreate("world", { userId, username })`. At most
+ * ROOM_MAX_CLIENTS (= the lobby's player bases) players: each owns one base (`PlayerState.base`).
+ * Loads and saves each signed-in player's progress (MongoDB, see db.ts) -- the client keeps no save of
+ * its own, so this is the only place progress lives. The game is client-authoritative: no gameplay
  * rules live here, saves are only bounded (sanitize.ts). Full rooms spill into a fresh one
- * automatically (maxClients).
+ * automatically (maxClients). The roster also carries what the others draw: every player's pose,
+ * Bloxity look, worn gear, held package and emote, and the North Lane houses a player is engaging
+ * (`state.houses`: the neighbour's animation).
  */
 export class WorldRoom extends Room<{ state: WorldState }> {
   state = new WorldState();
@@ -36,12 +41,11 @@ export class WorldRoom extends Room<{ state: WorldState }> {
   // sessionIds whose current identity's save has been read: only these may write. A save sent
   // before the load answered would overwrite the stored progress with a fresh player's defaults.
   private loaded = new Set<string>();
-  // sessionId -> Spin wheel state (spin.ts), set once the session's save has been read. Kept for
-  // guests and serverless sessions too (it then lasts the connection).
-  private spinStates = new Map<string, SpinState>();
-  // sessionId -> Daily Reward state (daily.ts), read with the save. Guests and serverless sessions
-  // keep theirs here only (like the rest of their progress, it lasts the session).
-  private dailies = new Map<string, DailyState>();
+  // sessionId -> epoch ms the next ad gift may be paid (read with the save; guests keep it for the connection).
+  private giftAt = new Map<string, number>();
+  private giftBusy = new Set<string>();
+  // house index -> epoch ms of its last update (stale ones are dropped).
+  private houseSeen = new Map<string, number>();
 
   messages = {
     // Debounced push of the client's whole progress. Upserts, so a first save creates the document.
@@ -54,15 +58,17 @@ export class WorldRoom extends Room<{ state: WorldState }> {
       if (!userId) return;
       const players = getPlayers();
       if (!players) return; // Mongo unset/unreachable -- degrade silently
-      // The personal best only ever goes up ($max), so a stale or replayed save can't lower it.
-      const { bestDistance, ...rest } = patch;
+      // Lifetime counters only ever go up ($max), so a stale or replayed save can't lower a leaderboard place.
+      const { earned, scares, steals, playtime, ...rest } = patch;
+      const max: Record<string, number> = {};
+      for (const [k, v] of Object.entries({ earned, scares, steals, playtime })) if (v !== undefined) max[k] = v;
       try {
         await players.updateOne(
           { _id: userId },
           {
             // Display name comes from this connection's own PlayerState, not `msg`.
             $set: { ...rest, username: p.username || "Player", updatedAt: new Date() },
-            ...(bestDistance !== undefined && { $max: { bestDistance } }),
+            ...(Object.keys(max).length && { $max: max }),
             $setOnInsert: { version: 1 },
           },
           { upsert: true },
@@ -71,52 +77,8 @@ export class WorldRoom extends Room<{ state: WorldState }> {
         console.warn("[WorldRoom] saveProgress failed", err);
       }
     },
-    // Claims Daily Reward day `msg.day` (0-based). The server decides: answers `dailyResult`
-    // { ok, day, ...state }; the client only grants the reward on ok.
-    claimDaily: async (client: Client, msg: { day?: unknown }) => {
-      const s = this.dailies.get(client.sessionId);
-      const day = msg?.day;
-      if (!s || !this.loaded.has(client.sessionId)) return client.send("dailyResult", { ok: false, day, reason: "loading" });
-      if (rollDaily(s)) void this.saveDaily(client.sessionId, s); // midnight passed while online
-      if (!claimDaily(s, day)) return client.send("dailyResult", { ok: false, day, reason: "locked", ...dailyView(s) });
-      if (!(await this.saveDaily(client.sessionId, s))) {
-        s.claimed = s.claimed.filter((i) => i !== day); // not stored: not claimed
-        return client.send("dailyResult", { ok: false, day, reason: "save", ...dailyView(s) });
-      }
-      client.send("dailyResult", { ok: true, day, ...dailyView(s) });
-    },
-    // The client's countdown reached the next UTC day: unlock it (server clock) and answer `daily`.
-    dailyRefresh: (client: Client) => {
-      const s = this.dailies.get(client.sessionId);
-      if (!s || !this.loaded.has(client.sessionId)) return;
-      if (rollDaily(s)) void this.saveDaily(client.sessionId, s);
-      client.send("daily", dailyView(s));
-    },
-    // Spin wheel: uses one spin and rolls the prize here, so the client can't choose it. Answers
-    // `spinResult` { ok, id (SPIN_WEDGES id), spins, nextAt, serverTime } or { ok: false, reason }.
-    spin: async (client: Client) => {
-      const s = this.spinStates.get(client.sessionId);
-      if (!s) return client.send("spinResult", { ok: false, reason: "loading" });
-      const now = Date.now();
-      accrue(s, now);
-      if (s.spins < 1) return client.send("spinResult", { ok: false, reason: "none", ...this.spinView(s, now) });
-      s.spins--;
-      accrue(s, now); // dropping below the cap starts the free-spin clock
-      const wedge = rollWedge();
-      client.send("spinResult", { ok: true, id: wedge.id, ...this.spinView(s, now) });
-      await this.saveSpins(client.sessionId, s);
-    },
-    // The sender's race, relayed through the roster so everyone draws them on the distance bar and
-    // podium: { racing, distance (studs this race) }, a few times a second while racing.
-    race: (client: Client, msg: { racing?: unknown; distance?: unknown }) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      p.racing = msg?.racing === true;
-      const d = msg?.distance;
-      p.distance = p.racing && typeof d === "number" && Number.isFinite(d) ? Math.min(DISTANCE_MAX, Math.max(0, d)) : 0;
-    },
-    // Presence (presence.ts): the sender's pose ~10x/s, its equipped gear and its Bloxity look,
-    // relayed through the roster so everyone draws them in the world (client remotePlayers.js).
+    // Presence (presence.ts): the sender's pose ~10x/s, what it holds / wears and its Bloxity look,
+    // relayed through the roster so everyone draws it in the world (client remotePlayers.js).
     pose: (client: Client, msg: unknown) => {
       const p = this.state.players.get(client.sessionId);
       if (p) applyPose(p, msg);
@@ -128,6 +90,66 @@ export class WorldRoom extends Room<{ state: WorldState }> {
     setAvatar: (client: Client, msg: unknown) => {
       const p = this.state.players.get(client.sessionId);
       if (p) applyAvatar(p, msg);
+    },
+    // A Bloxity emote started ({ id }) or stopped ({ id: "" }).
+    emote: (client: Client, msg: unknown) => {
+      const p = this.state.players.get(client.sessionId);
+      if (p) applyEmote(p, msg);
+    },
+    // The sender is driving North Lane house `i` (its neighbour's state, ~10x/s): everybody else draws
+    // the same animation. One driver per house: another player's update for a house already driven by
+    // someone else is ignored until it goes quiet.
+    house: (client: Client, msg: unknown) => {
+      const i = readHouseIndex(msg);
+      if (i < 0 || !this.state.players.has(client.sessionId)) return;
+      const key = String(i);
+      let h = this.state.houses.get(key);
+      if (h && h.owner !== client.sessionId) return;
+      if (!h) {
+        h = new HouseState();
+        this.state.houses.set(key, h);
+      }
+      applyHouse(h, client.sessionId, msg);
+      this.houseSeen.set(key, Date.now());
+    },
+    // The sender is done with house `i` (the neighbour went home).
+    houseEnd: (client: Client, msg: unknown) => {
+      const i = readHouseIndex(msg);
+      const key = String(i);
+      if (i >= 0 && this.state.houses.get(key)?.owner === client.sessionId) this.dropHouse(key);
+    },
+    // Free Gift: the sender watched a rewarded ad (Legion.SDK.ads.showRewarded -> "completed") and sends its
+    // reward token. The server verifies it with Bloxity and enforces the cooldown, then answers
+    // `giftResult` { ok, amount, nextAt, serverTime } or { ok: false, reason: "cooldown" | "invalid" | "busy", nextAt }.
+    // The client only grants the money on ok.
+    adGift: async (client: Client, msg: { token?: unknown }) => {
+      const sid = client.sessionId;
+      const now = Date.now();
+      const reply = (r: Record<string, unknown>) => {
+        try {
+          client.send("giftResult", { serverTime: Date.now(), nextAt: this.giftAt.get(sid) ?? 0, ...r });
+        } catch {
+          // Gone meanwhile.
+        }
+      };
+      const token = msg?.token;
+      if (typeof token !== "string" || !token || token.length > REWARD_TOKEN_MAX_LEN) return reply({ ok: false, reason: "invalid" });
+      if (this.giftBusy.has(sid)) return reply({ ok: false, reason: "busy" });
+      if ((this.giftAt.get(sid) ?? 0) > now) return reply({ ok: false, reason: "cooldown" });
+      this.giftBusy.add(sid);
+      try {
+        const check = await verifyReward(token);
+        if (!this.state.players.has(sid)) return;
+        // A signed-in player's ad must belong to them (a guest's token has no user).
+        const mine = this.userIds.get(sid);
+        if (!check.valid || (check.userId && mine && check.userId !== mine)) return reply({ ok: false, reason: "invalid" });
+        const nextAt = Date.now() + AD_GIFT_COOLDOWN_MS;
+        this.giftAt.set(sid, nextAt);
+        await this.saveGiftAt(sid, nextAt);
+        reply({ ok: true, amount: AD_GIFT_MONEY, nextAt });
+      } finally {
+        this.giftBusy.delete(sid);
+      }
     },
     // Re-states identity after a login/logout that happens AFTER join (a guest who signs in
     // mid-session). The server answers with progress/noProgress for the new identity.
@@ -141,14 +163,19 @@ export class WorldRoom extends Room<{ state: WorldState }> {
   };
 
   // Leaderboards (leaderboard.ts): everyone gets the top lists + their own ranks every
-  // LEADERBOARD_EVERY_MS, and once right after their save loads.
+  // LEADERBOARD_EVERY_MS, and once right after their save loads. Houses nobody updates any more
+  // (their driver crashed) are dropped every second.
   onCreate() {
     this.clock.setInterval(() => {
       for (const c of this.clients) void this.sendLeaderboard(c);
     }, LEADERBOARD_EVERY_MS);
+    this.clock.setInterval(() => {
+      const now = Date.now();
+      for (const [key, at] of this.houseSeen) if (now - at > NEIGHBOUR_STALE_MS) this.dropHouse(key);
+    }, 1000);
   }
 
-  // `leaderboard` { boards: { rebirths|trophies|energy|playtime: [{ name, value }] }, ranks: { stat: n | null } }.
+  // `leaderboard` { boards: { earned|scares|steals|playtime: [{ name, value }] }, ranks: { stat: n | null } }.
   private async sendLeaderboard(client: Client) {
     const userId = this.userIds.get(client.sessionId) ?? "";
     const [boards, ranks] = await Promise.all([topBoards(), ranksOf(userId)]);
@@ -160,10 +187,19 @@ export class WorldRoom extends Room<{ state: WorldState }> {
     }
   }
 
-  onJoin(client: Client, options?: { username?: string; userId?: string; pfp?: string; pose?: unknown; loadout?: unknown; avatar?: string }) {
+  private dropHouse(key: string) {
+    this.state.houses.delete(key);
+    this.houseSeen.delete(key);
+  }
+
+  onJoin(client: Client, options?: { username?: string; userId?: string; pfp?: string; pose?: unknown; loadout?: unknown; avatar?: string; base?: unknown }) {
     const p = new PlayerState();
     p.username = sanitizeName(options?.username);
     p.pfp = sanitizePfp(options?.pfp);
+    // The player's own base: the one they asked for (the client builds its machines there) if it is free.
+    const taken = new Set<number>();
+    this.state.players.forEach((o) => o.base >= 0 && taken.add(o.base));
+    p.base = assignBase(taken, options?.base);
     // Presence from the join options, so the others draw the newcomer right away.
     applyPose(p, options?.pose);
     applyLoadout(p, options?.loadout);
@@ -200,52 +236,28 @@ export class WorldRoom extends Room<{ state: WorldState }> {
     }
   }
 
-  // Drops a session's per-connection bookkeeping.
+  // Drops a session's per-connection bookkeeping: its base is free again and the houses it was driving stop.
   private forgetSession(sessionId: string) {
     this.state.players.delete(sessionId);
     this.userIds.delete(sessionId);
     this.identified.delete(sessionId);
     this.loaded.delete(sessionId);
-    this.dailies.delete(sessionId);
-    this.spinStates.delete(sessionId);
+    this.giftAt.delete(sessionId);
+    this.giftBusy.delete(sessionId);
+    this.state.houses.forEach((h, key) => {
+      if (h.owner === sessionId) this.dropHouse(key);
+    });
   }
 
-  private spinView(s: SpinState, now: number) {
-    return { spins: s.spins, nextAt: s.nextAt, serverTime: now };
-  }
-
-  // The spin fields go straight to Mongo (saveProgress never carries them).
-  private async saveSpins(sessionId: string, s: SpinState) {
+  // The gift cooldown goes straight to Mongo (saveProgress never carries it).
+  private async saveGiftAt(sessionId: string, giftAt: number) {
     const userId = this.userIds.get(sessionId);
     const players = getPlayers();
     if (!userId || !players) return;
     try {
-      await players.updateOne(
-        { _id: userId },
-        { $set: { spins: s.spins, spinAt: s.nextAt, updatedAt: new Date() }, $setOnInsert: { version: 1 } },
-        { upsert: true },
-      );
+      await players.updateOne({ _id: userId }, { $set: { giftAt, updatedAt: new Date() }, $setOnInsert: { version: 1 } }, { upsert: true });
     } catch (err) {
-      console.warn("[WorldRoom] saveSpins failed", err);
-    }
-  }
-
-  // Stores a session's Daily Reward state. True when stored, or when there is nowhere to store it
-  // (guest / no database: it lives in `dailies` for the session).
-  private async saveDaily(sessionId: string, s: DailyState): Promise<boolean> {
-    const userId = this.userIds.get(sessionId);
-    const players = getPlayers();
-    if (!userId || !players) return true;
-    try {
-      await players.updateOne(
-        { _id: userId },
-        { $set: { ...dailyFields(s), updatedAt: new Date() }, $setOnInsert: { version: 1 } },
-        { upsert: true },
-      );
-      return true;
-    } catch (err) {
-      console.warn("[WorldRoom] saveDaily failed", err);
-      return false;
+      console.warn("[WorldRoom] saveGiftAt failed", err);
     }
   }
 
@@ -253,7 +265,7 @@ export class WorldRoom extends Room<{ state: WorldState }> {
   // only read/overwrite the SENDER's own save (there is no cross-player read in `saveProgress`).
   // Called from both onJoin and `identify`; answers with progress / noProgress / serverError.
   private setUserId(client: Client, p: PlayerState, raw: string) {
-    let userId = raw.slice(0, 128);
+    let userId = raw.slice(0, UID_MAX_LEN);
     // Guests (client-made `guest-...` ids) get no identity: nothing is loaded or saved for them.
     if (userId.startsWith(GUEST_ID_PREFIX)) userId = "";
     const prev = this.userIds.get(client.sessionId) || "";
@@ -261,8 +273,8 @@ export class WorldRoom extends Room<{ state: WorldState }> {
     if (userId === prev && this.identified.has(client.sessionId)) return;
     this.identified.add(client.sessionId);
     this.loaded.delete(client.sessionId); // no writes until the new identity's save is read
-    this.spinStates.delete(client.sessionId); // nor spins
     p.signedIn = !!userId;
+    p.uid = userId;
 
     if (userId) {
       // Evict any OTHER live session already claiming this account, so one account never has
@@ -310,17 +322,10 @@ export class WorldRoom extends Room<{ state: WorldState }> {
 
     this.loaded.add(client.sessionId);
     const now = Date.now();
-    const spin = spinStateFrom(doc, now);
-    this.spinStates.set(client.sessionId, spin);
+    if (!this.giftAt.has(client.sessionId) || userId) this.giftAt.set(client.sessionId, Number(doc?.giftAt) || 0);
     if (!doc) client.send("noProgress", { serverTime: now });
     else client.send("progress", { ...(sanitizeProgress(doc) ?? {}), serverTime: now });
-    client.send("spins", this.spinView(spin, now));
-
-    // Daily Reward: today's day unlocks on join (server clock), then the client gets the calendar.
-    const daily = readDaily(doc);
-    this.dailies.set(client.sessionId, daily);
-    if (rollDaily(daily)) await this.saveDaily(client.sessionId, daily);
-    if (this.dailies.get(client.sessionId) === daily) client.send("daily", dailyView(daily));
+    client.send("giftResult", { ok: false, reason: "init", nextAt: this.giftAt.get(client.sessionId) ?? 0, serverTime: now });
     void this.sendLeaderboard(client);
   }
 }
